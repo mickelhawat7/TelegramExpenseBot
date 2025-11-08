@@ -17,14 +17,13 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 from telegram import (
-    ParseMode,
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
 
-# ---------------- Matplotlib setup (no GUI, no font warnings) ----------------
-matplotlib.use("Agg")  # headless backend
+# ---------------- Matplotlib setup ----------------
+matplotlib.use("Agg")  # headless backend (no GUI)
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 matplotlib.rcParams["font.family"] = ["DejaVu Sans", "sans-serif"]
 
@@ -38,7 +37,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
     raise SystemExit("Missing TELEGRAM_TOKEN env var")
 
-DATA_DIR = os.getenv("DATA_DIR", "/data")  # Railway volume
+DATA_DIR = os.getenv("DATA_DIR", "/data")
 pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 DB_FILE = os.path.abspath(os.path.join(DATA_DIR, "expenses.db"))
 
@@ -46,6 +45,7 @@ LOCK_PATH = os.path.join(DATA_DIR, "bot.lock")
 _lock_fh = None
 
 def acquire_singleton_lock():
+    """Ensure only one bot process per container"""
     global _lock_fh
     _lock_fh = open(LOCK_PATH, "w")
     try:
@@ -66,8 +66,7 @@ def connect_db():
 
 def ensure_db():
     with connect_db() as conn:
-        c = conn.cursor()
-        c.execute(
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
@@ -154,18 +153,22 @@ def get_category_details_all(category):
         c = conn.cursor()
         c.execute(
             "SELECT id, timestamp, amount, note FROM expenses "
-            "WHERE entry_type='Expense' AND LOWER(category)=? ORDER BY datetime(timestamp) DESC, id DESC",
+            "WHERE entry_type='Expense' AND LOWER(category)=? "
+            "ORDER BY datetime(timestamp) DESC, id DESC",
             (category,),
         )
         return c.fetchall()
 
 # ---------------- Utils ----------------
-def pretty(cat): return (cat or "").strip().title()
+def pretty(cat):
+    return (cat or "").strip().title()
 
 def schedule_autodelete(job_queue, chat_id, msg_id, seconds=60):
     def _delete(context: CallbackContext):
-        try: context.bot.delete_message(chat_id, msg_id)
-        except Exception: pass
+        try:
+            context.bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
     job_queue.run_once(_delete, seconds)
 
 def parse_amount(token: str) -> int:
@@ -174,25 +177,28 @@ def parse_amount(token: str) -> int:
         raise ValueError("no integer")
     return int(s)
 
-def fmt_money_int(x): 
-    return f"${int(round(x)):,}"  # adds commas
+def fmt_money_int(x):
+    return f"${int(round(x)):,}"
 
 # ---------------- Commands ----------------
 def help_command(update: Update, context: CallbackContext):
     txt = (
-        "*💰 Expense AI Tracker*\n"
-        "`Category Amount [optional note]`\nExample: `Food 2500 Lunch`\n\n"
-        "📊 `/sum` — Totals by category\n"
-        "🗓 `/today` — Today\n"
-        "📅 `/week` — This week\n"
-        "📈 `/month` — This month\n"
-        "🏆 `/top` — Charts\n"
-        "🔎 `/detail <category>` — Details\n"
-        "❌ `/delete <id>` — Delete entry\n"
-        "🗑️ `/clear` — Clear all + reset IDs\n"
-        "💡 Whole numbers only. Values show commas."
+        "💰 Welcome to your Expense AI Tracker!\n\n"
+        "To log an expense, simply type:\n"
+        "Category Amount [optional note]\n"
+        "Example: Food 2500 Lunch\n\n"
+        "✨ Commands:\n"
+        "📊 /sum — Totals by category\n"
+        "🗓 /today — Today’s expenses\n"
+        "📅 /week — This week’s expenses\n"
+        "📈 /month — This month’s expenses\n"
+        "🏆 /top — Expense charts\n"
+        "🔎 /detail <category> — Details for a category\n"
+        "❌ /delete <id> — Delete an entry\n"
+        "🗑️ /clear — Clear all data and reset IDs\n\n"
+        "💡 All entries are logged in $."
     )
-    m = update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    m = update.message.reply_text(txt)
     schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
 
 def _period_summary(update, context, title, start, end):
@@ -201,20 +207,24 @@ def _period_summary(update, context, title, start, end):
         m = update.message.reply_text(f"No {title.lower()} expenses yet.")
         return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
     totals.sort(key=lambda t: (t[1] or 0), reverse=True)
-    txt = f"📅 *{title} Expenses:*\n\n" + "".join(f"{pretty(c)}: {fmt_money_int(a)}\n" for c, a in totals)
-    m = update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    lines = [f"{pretty(c)}: {fmt_money_int(a)}" for c, a in totals]
+    txt = f"{title} Expenses:\n\n" + "\n".join(lines)
+    m = update.message.reply_text(txt)
     schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
 
 def today(u, c):
-    n = datetime.now(); start = n.replace(hour=0, minute=0, second=0, microsecond=0)
+    n = datetime.now()
+    start = n.replace(hour=0, minute=0, second=0, microsecond=0)
     _period_summary(u, c, "Today", start, n)
 
 def week(u, c):
-    n = datetime.now(); start = (n - timedelta(days=n.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    n = datetime.now()
+    start = (n - timedelta(days=n.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     _period_summary(u, c, "Week", start, n)
 
 def month(u, c):
-    n = datetime.now(); start = n.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    n = datetime.now()
+    start = n.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     _period_summary(u, c, "Month", start, n)
 
 def sum_all(u, c):
@@ -223,8 +233,9 @@ def sum_all(u, c):
         m = u.message.reply_text("No expenses logged yet.")
         return schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
     totals.sort(key=lambda t: (t[1] or 0), reverse=True)
-    txt = "💰 *Total Expenses:*\n\n" + "".join(f"{pretty(ca)}: {fmt_money_int(a)}\n" for ca, a in totals)
-    m = u.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    lines = [f"{pretty(ca)}: {fmt_money_int(a)}" for ca, a in totals]
+    txt = "💰 Total Expenses:\n\n" + "\n".join(lines)
+    m = u.message.reply_text(txt)
     schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
 
 def top_command(update: Update, context: CallbackContext):
@@ -232,18 +243,26 @@ def top_command(update: Update, context: CallbackContext):
     if not data:
         m = update.message.reply_text("No expenses yet.")
         return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+
     labels = [pretty(c) for c, _ in data]
     sizes = [int(round(a)) for _, a in data]
+
     fig1, ax1 = plt.subplots()
     ax1.pie(sizes, labels=labels, autopct=lambda p: f"{int(p)}%", startangle=90)
     plt.title("Expense Distribution (%)")
     pie = "pie.png"
-    plt.savefig(pie, bbox_inches="tight", facecolor="white"); plt.close(fig1)
-    with open(pie, "rb") as f: pie_msg = update.message.reply_photo(f)
-    os.remove(pie)
-    msg = update.message.reply_text(
-        "🏆 *Expense Chart Summary:*\n" + "".join(f"{l}: {fmt_money_int(s)}\n" for l, s in zip(labels, sizes)),
-        parse_mode=ParseMode.MARKDOWN)
+    plt.savefig(pie, bbox_inches="tight", facecolor="white")
+    plt.close(fig1)
+
+    with open(pie, "rb") as f:
+        pie_msg = update.message.reply_photo(f)
+    try:
+        os.remove(pie)
+    except Exception:
+        pass
+
+    summary_lines = [f"{l}: {fmt_money_int(s)}" for l, s in zip(labels, sizes)]
+    msg = update.message.reply_text("🏆 Expense Chart Summary:\n\n" + "\n".join(summary_lines))
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
 
 def detail_command(update: Update, context: CallbackContext):
@@ -256,9 +275,9 @@ def detail_command(update: Update, context: CallbackContext):
     if not rows:
         m = update.message.reply_text(f"No entries for {pretty(cat)}.")
         return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
-    header = f"💰 *{pretty(cat)}* Total: {fmt_money_int(total)}\n"
-    lines = [f"#{i} · {t} · {fmt_money_int(a)} {n or ''}" for i, t, a, n in rows]
-    msg = update.message.reply_text(header + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    header = f"💰 {pretty(cat)} Total: {fmt_money_int(total)}\n"
+    lines = [f"#{i} · {t} · {fmt_money_int(a)} {n or ''}".rstrip() for i, t, a, n in rows]
+    msg = update.message.reply_text(header + "\n".join(lines))
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
 
 def delete_command(u, c):
@@ -268,8 +287,10 @@ def delete_command(u, c):
     try:
         i = int(c.args[0])
         msg = "✅ Deleted." if delete_expense_by_id_global(i) else "No such entry."
-    except: msg = "Invalid ID."
-    m = u.message.reply_text(msg); schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
+    except:
+        msg = "Invalid ID."
+    m = u.message.reply_text(msg)
+    schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
 
 def clear_command(u, c):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data="clear_confirm"),
@@ -295,21 +316,23 @@ def debugdb(update, context):
 
 def health(update, context):
     try:
-        with connect_db() as conn: conn.execute("SELECT 1")
-        update.message.reply_text("✅ OK")
+        with connect_db() as conn:
+            conn.execute("SELECT 1")
+        update.message.reply_text("OK")
     except Exception as e:
-        update.message.reply_text(f"❌ DB error: {e}")
+        update.message.reply_text(f"DB error: {e}")
 
 # ---------------- Text Router ----------------
 def text_router(u, c):
-    parts = u.message.text.strip().split(None, 2)
+    parts = (u.message.text or "").strip().split(None, 2)
     if len(parts) < 2:
-        m = u.message.reply_text("❌ Example: `Food 2500 Lunch`", parse_mode=ParseMode.MARKDOWN)
+        m = u.message.reply_text("❌ Example: Food 2500 Lunch")
         return schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
     cat = parts[0].lower()
-    try: amt = parse_amount(parts[1])
-    except: 
-        m = u.message.reply_text("❌ Enter a valid whole number.")
+    try:
+        amt = parse_amount(parts[1])
+    except:
+        m = u.message.reply_text("❌ Enter a valid whole number (e.g., 2500).")
         return schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
     note = parts[2] if len(parts) > 2 else ""
     eid = log_expense_to_db(cat, amt, note)
@@ -322,7 +345,8 @@ def on_error(update, context):
     try:
         if isinstance(update, Update) and update.effective_message:
             update.effective_message.reply_text("⚠️ Something went wrong.")
-    except: pass
+    except:
+        pass
 
 # ---------------- Main ----------------
 def main():
