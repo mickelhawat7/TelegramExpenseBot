@@ -165,12 +165,24 @@ def schedule_autodelete(job_queue, chat_id, message_id, seconds=60):
         except Exception: pass
     job_queue.run_once(_delete, seconds)
 
-_amount_re = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?")
-def parse_amount(token: str):
-    m = _amount_re.search(token.replace("$", ""))
-    if not m:
-        raise ValueError("no number")
-    return float(m.group(0).replace(",", ""))
+# Integer-only amount parser (no decimals, no commas)
+def parse_amount(token: str) -> int:
+    """
+    Accepts integers only (with optional +/- sign). Examples:
+      '10000' -> 10000
+      '+2500' -> 2500
+      '$3000' -> 3000
+    Any dots/commas/decimals are stripped; result must be an integer.
+    """
+    s = token.strip()
+    # remove spaces and currency words/symbols
+    s = re.sub(r'[\s\u00A0]', '', s)
+    s = re.sub(r'(?i)(usd|eur|sar|lbp|egp|aed|qar|kwd|gbp|dollar|euro|lira|riyal|£|€|\$)', '', s)
+    # keep only digits and sign
+    s = re.sub(r'[^0-9+\-]', '', s)
+    if not re.fullmatch(r'[+\-]?\d+', s):
+        raise ValueError("no integer")
+    return int(s)
 
 # ---------- /help ----------
 def help_command(update: Update, context: CallbackContext):
@@ -188,19 +200,23 @@ def help_command(update: Update, context: CallbackContext):
         "🔎 `/detail <category>` — Details\n"
         "❌ `/delete <id>` — Delete entry\n"
         "🗑️ `/clear` — Delete ALL data\n\n"
-        "💡 No need to type `$` — values are in dollars."
+        "💡 Amounts are whole numbers (no decimals)."
     )
     msg = update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
 
 # ---------- Period summaries ----------
+def _fmt_money(x) -> str:
+    # force integer display
+    return f"${int(round(x))}"
+
 def _period_summary_core(update, context, title, start, end):
     totals = get_totals_all(start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
     if not totals:
         m = update.message.reply_text(f"No {title.lower()} expenses logged yet.")
         return schedule_autodelete(context.job_queue, m.chat_id, m.message_id, 60)
     totals.sort(key=lambda t: (t[1] or 0), reverse=True)
-    text = f"📅 *{title} Expenses:*\n\n" + "".join(f"{pretty(c)}: ${a:.2f}\n" for c, a in totals)
+    text = f"📅 *{title} Expenses:*\n\n" + "".join(f"{pretty(c)}: {_fmt_money(a)}\n" for c, a in totals)
     m = update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(context.job_queue, m.chat_id, m.message_id, 60)
 
@@ -225,7 +241,7 @@ def sum_all(u, c):
         m = u.message.reply_text("No expenses logged yet.")
         return schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 60)
     totals.sort(key=lambda t: (t[1] or 0), reverse=True)
-    text = "💰 *Total Expenses by Category:*\n\n" + "".join(f"{pretty(ca)}: ${a:.2f}\n" for ca, a in totals)
+    text = "💰 *Total Expenses by Category:*\n\n" + "".join(f"{pretty(ca)}: {_fmt_money(a)}\n" for ca, a in totals)
     m = u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 60)
 
@@ -237,10 +253,14 @@ def top_command(update: Update, context: CallbackContext):
         return schedule_autodelete(context.job_queue, m.chat_id, m.message_id, 60)
 
     labels = [pretty(c) for c, _ in data]
-    sizes = [float(a) for _, a in data]
+    sizes = [int(round(float(a))) for _, a in data]  # integers for bars
+
+    # PIE with integer percent labels
+    def pct_int(pct):
+        return f"{int(round(pct))}%"
 
     fig1, ax1 = plt.subplots()
-    wedges, texts, autotexts = ax1.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
+    wedges, texts, autotexts = ax1.pie(sizes, labels=labels, autopct=pct_int, startangle=90)
     for t in texts + autotexts:
         t.set_color("black"); t.set_fontweight("bold")
     ax1.axis("equal")
@@ -249,6 +269,7 @@ def top_command(update: Update, context: CallbackContext):
     plt.savefig(pie_path, bbox_inches="tight", facecolor="white")
     plt.close(fig1)
 
+    # BAR (white background)
     fig2, ax2 = plt.subplots()
     cmap = matplotlib.cm.get_cmap("tab20")
     colors = [cmap(i % cmap.N) for i in range(len(labels))]
@@ -258,7 +279,7 @@ def top_command(update: Update, context: CallbackContext):
     ax2.set_xlabel("Category")
     plt.xticks(rotation=20, ha="right")
     for bar, val in zip(bars, sizes):
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height()/2, f"${val:.2f}",
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height()/2, f"${int(val)}",
                  ha="center", va="center", fontsize=10, fontweight="bold")
     plt.tight_layout()
     bar_path = "categories_bar.png"
@@ -275,7 +296,7 @@ def top_command(update: Update, context: CallbackContext):
     except Exception:
         pass
 
-    summary = "🏆 *Expense Charts Summary:*\n" + "".join(f"{l}: ${s:.2f}\n" for l, s in zip(labels, sizes))
+    summary = "🏆 *Expense Charts Summary:*\n" + "".join(f"{l}: ${int(s)}\n" for l, s in zip(labels, sizes))
     text_msg = update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
 
     for msg in (pie_msg, bar_msg, text_msg):
@@ -293,11 +314,11 @@ def detail_command(update: Update, context: CallbackContext):
     if not details:
         m = update.message.reply_text(f"No entries for *{pretty(category_raw)}*.", parse_mode=ParseMode.MARKDOWN)
         return schedule_autodelete(context.job_queue, m.chat_id, m.message_id, 60)
-    header = f"💰 *{pretty(category_raw)}* — All-Time Total: ${total:.2f}\n"
+    header = f"💰 *{pretty(category_raw)}* — All-Time Total: ${int(round(total))}\n"
     lines = []
     for _id, ts, amt, note in details:
         note_part = f" · {note}" if note else ""
-        lines.append(f"#{_id} · {ts} · ${amt:.2f}{note_part}")
+        lines.append(f"#{_id} · {ts} · ${int(round(amt))}{note_part}")
     msg = update.message.reply_text(header + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
 
@@ -357,22 +378,22 @@ def text_router(u, c):
 
     category_lower = parts[0].lower().strip()
     try:
-        amount = parse_amount(parts[1])
+        amount_int = parse_amount(parts[1])  # integer only
     except Exception:
         m = u.message.reply_text(
-            "❌ Amount must be a number.\nExamples: `Food 25`, `Food $25`, `Food 1,200`",
+            "❌ Amount must be a whole number.\nExamples: `Food 25`, `Rent 10000`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 30)
 
     note = parts[2] if len(parts) > 2 else ""
-    exp_id = log_expense_to_db(category_lower, amount, note)
+    exp_id = log_expense_to_db(category_lower, amount_int, note)
     cat_sum = get_category_sum_all(category_lower)
     cat_name = pretty(category_lower)
 
     u.message.reply_text(
         f"✅ Logged (ID: {exp_id}).\n"
-        f"💰 {cat_name} All-Time Total: ${cat_sum:.2f}"
+        f"💰 {cat_name} All-Time Total: ${int(round(cat_sum))}"
     )
 
 # ---------- Main ----------
