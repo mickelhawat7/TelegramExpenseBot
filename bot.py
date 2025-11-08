@@ -239,7 +239,7 @@ def sum_all(u, c):
     txt = (
         "💰 Total Expenses:\n\n"
         + "\n".join(lines)
-        + f"\n\n📊 Total Project Expenses till date: {fmt_money_int(total_sum)}"
+        + f"\n\n💵 Total Project Expenses till date: {fmt_money_int(total_sum)}"
     )
     m = u.message.reply_text(txt)
     schedule_autodelete(c.job_queue, m.chat_id, m.message_id)
@@ -269,7 +269,7 @@ def top_command(update: Update, context: CallbackContext):
 
     total_sum = sum(sizes)
     summary_lines = [f"{l}: {fmt_money_int(s)}" for l, s in zip(labels, sizes)]
-    summary_lines.append(f"\n📊 Total Project Expenses till date: {fmt_money_int(total_sum)}")
+    summary_lines.append(f"\n💵 Total Project Expenses till date: {fmt_money_int(total_sum)}")
     msg = update.message.reply_text("🏆 Expense Chart Summary:\n\n" + "\n".join(summary_lines))
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
 
