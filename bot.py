@@ -35,7 +35,7 @@ matplotlib.rcParams["font.family"] = ["Calibri", "Arial", "DejaVu Sans", "Libera
 # --- Config ---
 DB_FILE = "expenses.db"
 EXCEL_FILE = "expenses.xlsx"
-TELEGRAM_TOKEN = "7002604173:AAHbyKtSPFRpqPlb-MTVoQ4cGEtYGi43a4Y"   # ← replace once with your real token
+TELEGRAM_TOKEN = "7002604173:AAF5WwPqlbRhFNVPMFMPsI6GT5lzD8qKWyc"   # ← replace once with your real token
 
 # --- Database helpers ---
 def ensure_db():
@@ -378,3 +378,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
