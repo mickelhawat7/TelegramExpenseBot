@@ -2,7 +2,6 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
-import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import warnings
@@ -34,7 +33,6 @@ matplotlib.rcParams["font.family"] = ["Calibri", "Arial", "DejaVu Sans", "Libera
 
 # --- Config ---
 DB_FILE = "expenses.db"
-EXCEL_FILE = "expenses.xlsx"
 TELEGRAM_TOKEN = "7002604173:AAF5WwPqlbRhFNVPMFMPsI6GT5lzD8qKWyc"   # ← replace once with your real token
 
 # --- Database helpers ---
@@ -86,13 +84,6 @@ def get_totals_all(start_dt=None, end_dt=None):
                 "WHERE entry_type='Expense' GROUP BY category"
             )
         return c.fetchall()
-
-def get_all_expenses():
-    with sqlite3.connect(DB_FILE) as conn:
-        return pd.read_sql_query("SELECT * FROM expenses", conn)
-
-def export_db_to_excel():
-    get_all_expenses().to_excel(EXCEL_FILE, index=False)
 
 def clear_all_data():
     with sqlite3.connect(DB_FILE) as conn:
@@ -168,8 +159,7 @@ def help_command(update: Update, context: CallbackContext):
         "🔎 `/detail <category>` — View total and detailed logs for a category\n"
         "❌ `/delete <id>` — Delete a specific entry\n"
         "🗑️ `/clear` — Delete all your data\n\n"
-        "💡 No need to use the `$` sign — all entries are logged in dollars.\n\n"
-        "✅ Every transaction is automatically saved to your Excel file.\n"
+        "💡 No need to use the `$` sign — all entries are logged in dollars."
     )
     msg = update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
@@ -302,7 +292,6 @@ def delete_command(u, c):
         msg = f"❌ Entry {exp_id} deleted." if success else f"No entry found with ID {exp_id}."
     except Exception:
         msg = "Invalid ID."
-    export_db_to_excel()
     m = u.message.reply_text(msg)
     schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 60)
 
@@ -319,13 +308,12 @@ def clear_callback(u, c):
     q = u.callback_query
     if q.data == "clear_confirm":
         clear_all_data()
-        export_db_to_excel()
         q.edit_message_text("✅ All data cleared.")
     else:
         q.edit_message_text("❌ Cancelled.")
     q.answer()
 
-# --- Text router (💰 Category All-Time Total) ---
+# --- Text router ---
 def text_router(u, c):
     parts = (u.message.text or "").strip().split(None, 2)
     if len(parts) < 2:
@@ -347,7 +335,6 @@ def text_router(u, c):
 
     note = parts[2] if len(parts) > 2 else ""
     exp_id = log_expense_to_db(category_lower, amount, note)
-    export_db_to_excel()
     cat_sum = get_category_sum_all(category_lower)
     cat_name = pretty(category_lower)
 
@@ -378,4 +365,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
