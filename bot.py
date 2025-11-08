@@ -2,9 +2,12 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
+import re
 import matplotlib
 import matplotlib.pyplot as plt
 import warnings
+import pathlib
+import fcntl  # Linux-only; Railway is Linux
 
 from telegram.ext import (
     Updater,
@@ -21,23 +24,47 @@ from telegram import (
     InlineKeyboardButton,
 )
 
-# --- Logging setup ---
+# ---------- Logging ----------
 warnings.filterwarnings("ignore", message="python-telegram-bot is using upstream urllib3")
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.")
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 matplotlib.rcParams["font.family"] = ["Calibri", "Arial", "DejaVu Sans", "Liberation Sans", "sans-serif"]
 
-# --- Config ---
-DB_FILE = "expenses.db"
-TELEGRAM_TOKEN = "7002604173:AAF5WwPqlbRhFNVPMFMPsI6GT5lzD8qKWyc"   # ← replace once with your real token
+# ---------- Config (ENV + Volume) ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+if not TELEGRAM_TOKEN:
+    raise SystemExit("Missing TELEGRAM_TOKEN env var")
 
-# --- Database helpers ---
+DATA_DIR = os.getenv("DATA_DIR", "/data")        # must be a Railway Volume mount
+pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+DB_FILE = os.path.abspath(os.path.join(DATA_DIR, "expenses.db"))
+
+LOCK_PATH = os.path.join(DATA_DIR, "bot.lock")   # ensures single instance in container
+_lock_fh = None
+
+def acquire_singleton_lock():
+    """Prevent multiple bot processes in the same container."""
+    global _lock_fh
+    _lock_fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh.write(str(os.getpid()))
+        _lock_fh.flush()
+        logging.info("🔒 Singleton lock acquired.")
+    except BlockingIOError:
+        logging.error("❌ Another bot process already holds the lock. Exiting.")
+        raise SystemExit(1)
+
+# ---------- DB helpers (persistent + WAL) ----------
+def connect_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
 def ensure_db():
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute(
             """CREATE TABLE IF NOT EXISTS expenses (
@@ -57,7 +84,7 @@ def ensure_db():
 
 def log_expense_to_db(category_lower, amount, note, user_hint=""):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO expenses (timestamp,user,entry_type,name,amount,category,note,payment_method,account_type)"
@@ -69,7 +96,7 @@ def log_expense_to_db(category_lower, amount, note, user_hint=""):
         return exp_id
 
 def get_totals_all(start_dt=None, end_dt=None):
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         if start_dt and end_dt:
             c.execute(
@@ -86,13 +113,13 @@ def get_totals_all(start_dt=None, end_dt=None):
         return c.fetchall()
 
 def clear_all_data():
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM expenses")
         conn.commit()
 
 def get_categories_with_sums_all():
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT category, SUM(amount) as total FROM expenses "
@@ -101,15 +128,14 @@ def get_categories_with_sums_all():
         return c.fetchall()
 
 def delete_expense_by_id_global(expense_id):
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
         conn.commit()
         return c.rowcount > 0
 
-# --- Category helpers ---
 def get_category_sum_all(category_lower):
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT COALESCE(SUM(amount),0) FROM expenses "
@@ -120,7 +146,7 @@ def get_category_sum_all(category_lower):
         return float(row[0] or 0.0)
 
 def get_category_details_all(category_lower):
-    with sqlite3.connect(DB_FILE) as conn:
+    with connect_db() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT id, timestamp, amount, note FROM expenses "
@@ -130,41 +156,44 @@ def get_category_details_all(category_lower):
         )
         return c.fetchall()
 
-# --- Utility ---
-def pretty(cat):
-    return (cat or "").strip().title()
+# ---------- Utils ----------
+def pretty(cat): return (cat or "").strip().title()
 
 def schedule_autodelete(job_queue, chat_id, message_id, seconds=60):
-    """Deletes messages automatically (default 60 s)."""
     def _delete(context: CallbackContext):
-        try:
-            context.bot.delete_message(chat_id, message_id)
-        except Exception:
-            pass
+        try: context.bot.delete_message(chat_id, message_id)
+        except Exception: pass
     job_queue.run_once(_delete, seconds)
 
-# --- /help ---
+_amount_re = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?")
+def parse_amount(token: str):
+    m = _amount_re.search(token.replace("$", ""))
+    if not m:
+        raise ValueError("no number")
+    return float(m.group(0).replace(",", ""))
+
+# ---------- /help ----------
 def help_command(update: Update, context: CallbackContext):
     text = (
-        "*💰 Welcome to your Expense AI Tracker!*\n"
-        "To log an expense, simply type:\n"
+        "*💰 Expense AI Tracker*\n"
+        "Log an expense:\n"
         "`Category Amount [optional note]`\n"
         "Example: `Food 25 Lunch`\n\n"
-        "✨ *Available Commands:*\n"
-        "📊 `/sum` — View total expenses by category\n"
-        "🗓 `/today` — Show today’s expenses\n"
-        "📅 `/week` — Show this week’s expenses\n"
-        "📈 `/month` — Show this month’s expenses\n"
-        "🏆 `/top` — View expense charts\n"
-        "🔎 `/detail <category>` — View total and detailed logs for a category\n"
-        "❌ `/delete <id>` — Delete a specific entry\n"
-        "🗑️ `/clear` — Delete all your data\n\n"
-        "💡 No need to use the `$` sign — all entries are logged in dollars."
+        "✨ *Commands:*\n"
+        "📊 `/sum` — Totals by category\n"
+        "🗓 `/today` — Today\n"
+        "📅 `/week` — This week\n"
+        "📈 `/month` — This month\n"
+        "🏆 `/top` — Charts\n"
+        "🔎 `/detail <category>` — Details\n"
+        "❌ `/delete <id>` — Delete entry\n"
+        "🗑️ `/clear` — Delete ALL data\n\n"
+        "💡 No need to type `$` — values are in dollars."
     )
     msg = update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
 
-# --- Period summaries ---
+# ---------- Period summaries ----------
 def _period_summary_core(update, context, title, start, end):
     totals = get_totals_all(start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
     if not totals:
@@ -200,7 +229,7 @@ def sum_all(u, c):
     m = u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 60)
 
-# --- /top (white background charts) ---
+# ---------- /top (charts) ----------
 def top_command(update: Update, context: CallbackContext):
     data = get_categories_with_sums_all()
     if not data:
@@ -210,21 +239,16 @@ def top_command(update: Update, context: CallbackContext):
     labels = [pretty(c) for c, _ in data]
     sizes = [float(a) for _, a in data]
 
-    # PIE (white background)
     fig1, ax1 = plt.subplots()
-    wedges, texts, autotexts = ax1.pie(
-        sizes, labels=labels, autopct="%1.1f%%", startangle=90
-    )
+    wedges, texts, autotexts = ax1.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
     for t in texts + autotexts:
-        t.set_color("black")
-        t.set_fontweight("bold")
+        t.set_color("black"); t.set_fontweight("bold")
     ax1.axis("equal")
     plt.title("Expense Distribution (%)", pad=16, color="black")
     pie_path = "categories_pie.png"
     plt.savefig(pie_path, bbox_inches="tight", facecolor="white")
     plt.close(fig1)
 
-    # BAR (white background)
     fig2, ax2 = plt.subplots()
     cmap = matplotlib.cm.get_cmap("tab20")
     colors = [cmap(i % cmap.N) for i in range(len(labels))]
@@ -234,23 +258,20 @@ def top_command(update: Update, context: CallbackContext):
     ax2.set_xlabel("Category")
     plt.xticks(rotation=20, ha="right")
     for bar, val in zip(bars, sizes):
-        x = bar.get_x() + bar.get_width() / 2
-        y = bar.get_height() / 2
-        ax2.text(x, y, f"${val:.2f}", ha="center", va="center", color="black", fontsize=10, fontweight="bold")
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height()/2, f"${val:.2f}",
+                 ha="center", va="center", fontsize=10, fontweight="bold")
     plt.tight_layout()
     bar_path = "categories_bar.png"
     plt.savefig(bar_path, bbox_inches="tight", facecolor="white")
     plt.close(fig2)
 
-    # Send images
     with open(pie_path, "rb") as img:
         pie_msg = update.message.reply_photo(img)
     with open(bar_path, "rb") as img:
         bar_msg = update.message.reply_photo(img)
 
     try:
-        os.remove(pie_path)
-        os.remove(bar_path)
+        os.remove(pie_path); os.remove(bar_path)
     except Exception:
         pass
 
@@ -260,7 +281,7 @@ def top_command(update: Update, context: CallbackContext):
     for msg in (pie_msg, bar_msg, text_msg):
         schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
 
-# --- /detail ---
+# ---------- /detail ----------
 def detail_command(update: Update, context: CallbackContext):
     if not context.args:
         m = update.message.reply_text("Usage: /detail <category>", parse_mode=ParseMode.MARKDOWN)
@@ -280,7 +301,7 @@ def detail_command(update: Update, context: CallbackContext):
     msg = update.message.reply_text(header + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
 
-# --- /delete ---
+# ---------- /delete ----------
 def delete_command(u, c):
     args = c.args
     if not args:
@@ -295,14 +316,13 @@ def delete_command(u, c):
     m = u.message.reply_text(msg)
     schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 60)
 
-# --- /clear ---
+# ---------- /clear ----------
 def clear_command(u, c):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm", callback_data="clear_confirm"),
          InlineKeyboardButton("❌ Cancel", callback_data="clear_cancel")]
     ])
-    prompt = "🗑️ This will permanently delete all data. Continue?"
-    u.message.reply_text(prompt, reply_markup=kb)
+    u.message.reply_text("🗑️ This will permanently delete all data. Continue?", reply_markup=kb)
 
 def clear_callback(u, c):
     q = u.callback_query
@@ -313,7 +333,19 @@ def clear_callback(u, c):
         q.edit_message_text("❌ Cancelled.")
     q.answer()
 
-# --- Text router ---
+# ---------- /debugdb ----------
+def debugdb(update, context):
+    with connect_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), MAX(id) FROM expenses")
+        count, max_id = c.fetchone()
+    msg = update.message.reply_text(
+        f"DB path: `{DB_FILE}`\nRows: {count}\nMax id: {max_id}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id, 60)
+
+# ---------- Text router ----------
 def text_router(u, c):
     parts = (u.message.text or "").strip().split(None, 2)
     if len(parts) < 2:
@@ -325,10 +357,10 @@ def text_router(u, c):
 
     category_lower = parts[0].lower().strip()
     try:
-        amount = float(parts[1])
+        amount = parse_amount(parts[1])
     except Exception:
         m = u.message.reply_text(
-            "❌ Amount must be a number.\nExample: `Food 25 Lunch`",
+            "❌ Amount must be a number.\nExamples: `Food 25`, `Food $25`, `Food 1,200`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return schedule_autodelete(c.job_queue, m.chat_id, m.message_id, 30)
@@ -339,14 +371,23 @@ def text_router(u, c):
     cat_name = pretty(category_lower)
 
     u.message.reply_text(
-        f"✅ Your transaction has been logged (ID: {exp_id}).\n"
+        f"✅ Logged (ID: {exp_id}).\n"
         f"💰 {cat_name} All-Time Total: ${cat_sum:.2f}"
     )
 
-# --- Main ---
+# ---------- Main ----------
 def main():
+    acquire_singleton_lock()  # prevent double start in container
     ensure_db()
-    up = Updater(TELEGRAM_TOKEN, use_context=True)
+
+    up = Updater(TELEGRAM_TOKEN, use_context=True, request_kwargs={"read_timeout": 30, "connect_timeout": 30})
+
+    # Kill any webhook that might still be set (prevents webhook+polling mix)
+    info = up.bot.get_webhook_info()
+    if info.url:
+        logging.info(f"Found webhook set to: {info.url} — deleting…")
+    up.bot.delete_webhook(drop_pending_updates=True)
+
     dp = up.dispatcher
     dp.add_handler(CommandHandler("help", help_command))
     dp.add_handler(CommandHandler("sum", sum_all))
@@ -357,10 +398,12 @@ def main():
     dp.add_handler(CommandHandler("detail", detail_command))
     dp.add_handler(CommandHandler("delete", delete_command))
     dp.add_handler(CommandHandler("clear", clear_command))
+    dp.add_handler(CommandHandler("debugdb", debugdb))
     dp.add_handler(CallbackQueryHandler(clear_callback, pattern="^clear_(confirm|cancel)$"))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_router))
-    up.start_polling()
-    logging.info("✅ Bot started successfully.")
+
+    up.start_polling(clean=True)  # also drops pending updates
+    logging.info("✅ Bot started successfully (polling, webhook cleared).")
     up.idle()
 
 if __name__ == "__main__":
