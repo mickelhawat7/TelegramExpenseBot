@@ -156,6 +156,7 @@ def schedule_autodelete(job_queue, chat_id, msg_id, seconds=60):
 
 # ---------------- Commands ----------------
 def help_command(update: Update, context: CallbackContext):
+    # Persistent help (no auto-delete)
     txt = (
         "**🧠 Welcome to your AI Data Tracker!**\n\n"
         "Easily log, visualize, and manage your financial data — both 💸 expenses and 💵 revenues.\n\n"
@@ -178,8 +179,7 @@ def help_command(update: Update, context: CallbackContext):
         "🧮 /totalrevenue — View detailed revenue list and total\n\n"
         "💡 All entries are automatically saved and logged in dollars ($)."
     )
-    m = update.message.reply_text(txt, parse_mode="Markdown")
-    schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+    update.message.reply_text(txt, parse_mode="Markdown")
 
 # ---- Revenue ----
 def revenue_command(update: Update, context: CallbackContext):
@@ -348,6 +348,7 @@ def main():
     dp.add_handler(CommandHandler("today", today))
     dp.add_handler(CommandHandler("week", week))
     dp.add_handler(CommandHandler("month", month))
+    # Keep /top minimal (you can re-enable charts later if you want)
     dp.add_handler(CommandHandler("top", lambda u, c: u.message.reply_text("Charts currently disabled in this build.")))
     dp.add_handler(CommandHandler("detail", detail_command))
     dp.add_handler(CommandHandler("delete", delete_command))
