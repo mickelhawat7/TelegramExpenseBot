@@ -71,7 +71,7 @@ def ensure_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
                 user TEXT,
-                entry_type TEXT,
+                entry_type TEXT,    -- 'Expense' or 'Revenue'
                 name TEXT,
                 amount REAL,
                 category TEXT,
@@ -95,6 +95,21 @@ def log_expense_to_db(category, amount, note):
         conn.commit()
         return exp_id
 
+def log_revenue_to_db(amount, note):
+    """Revenue logs share the same table so IDs continue naturally."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connect_db() as conn:
+        c = conn.cursor()
+        # Store category as 'revenue' for clarity (not used in sums)
+        c.execute(
+            "INSERT INTO expenses (timestamp,user,entry_type,name,amount,category,note,payment_method,account_type)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (now, "", "Revenue", "", amount, "revenue", note, "", ""),
+        )
+        rev_id = c.lastrowid
+        conn.commit()
+        return rev_id
+
 def get_totals_all(start=None, end=None):
     with connect_db() as conn:
         c = conn.cursor()
@@ -109,6 +124,12 @@ def get_totals_all(start=None, end=None):
                 "SELECT category, SUM(amount) FROM expenses WHERE entry_type='Expense' GROUP BY category"
             )
         return c.fetchall()
+
+def get_total_revenue_all():
+    with connect_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE entry_type='Revenue'")
+        return int(round(c.fetchone()[0] or 0))
 
 def clear_all_data_and_reset_ids():
     with connect_db() as conn:
@@ -188,19 +209,22 @@ def help_command(update: Update, context: CallbackContext):
         "Category Amount [optional note]\n"
         "Example: Food 2500 Lunch\n\n"
         "✨ Commands:\n"
-        "📊 /sum — Totals by category\n"
+        "📊 /sum — Totals by category (expenses)\n"
         "🗓 /today — Today’s expenses\n"
         "📅 /week — This week’s expenses\n"
         "📈 /month — This month’s expenses\n"
         "🏆 /top — Expense charts\n"
         "🔎 /detail <category> — Details for a category\n"
         "❌ /delete <id> — Delete an entry\n"
-        "🗑️ /clear — Clear all data and reset IDs\n\n"
+        "🗑️ /clear — Clear all data and reset IDs\n"
+        "💵 /revenue <amount> [note] — Log a revenue entry\n"
+        "🧮 /totalrevenue — Total revenue to date\n\n"
         "💡 All entries are logged in $."
     )
     m = update.message.reply_text(txt)
     schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
 
+# ----- Expenses: period summaries -----
 def _period_summary(update, context, title, start, end):
     totals = get_totals_all(start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
     if not totals:
@@ -273,6 +297,7 @@ def top_command(update: Update, context: CallbackContext):
     msg = update.message.reply_text("🏆 Expense Chart Summary:\n\n" + "\n".join(summary_lines))
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
 
+# ----- Expense details -----
 def detail_command(update: Update, context: CallbackContext):
     if not context.args:
         m = update.message.reply_text("Usage: /detail <category>")
@@ -288,6 +313,7 @@ def detail_command(update: Update, context: CallbackContext):
     msg = update.message.reply_text(header + "\n".join(lines))
     schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
 
+# ----- Delete / Clear -----
 def delete_command(u, c):
     if not c.args:
         m = u.message.reply_text("Usage: /delete <id>")
@@ -314,6 +340,31 @@ def clear_callback(u, c):
         q.edit_message_text("❌ Cancelled.")
     q.answer()
 
+# ----- Revenue commands -----
+def revenue_command(update: Update, context: CallbackContext):
+    """Usage: /revenue <amount> [optional note]"""
+    if not context.args:
+        m = update.message.reply_text("Usage: /revenue <amount> [note]")
+        return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+    try:
+        amount = parse_amount(context.args[0])
+    except Exception:
+        m = update.message.reply_text("❌ Enter a valid whole number. Example: /revenue 5000 Client A")
+        return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+    note = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    rid = log_revenue_to_db(amount, note)
+    total_rev = get_total_revenue_all()
+    msg = update.message.reply_text(
+        f"✅ Revenue logged (ID {rid})\n💵 Total Revenue to Date: {fmt_money_int(total_rev)}"
+    )
+    schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
+
+def totalrevenue_command(update: Update, context: CallbackContext):
+    total_rev = get_total_revenue_all()
+    msg = update.message.reply_text(f"🧮 Total Revenue to Date: {fmt_money_int(total_rev)}")
+    schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
+
+# ----- Diagnostics -----
 def debugdb(update, context):
     with connect_db() as conn:
         c = conn.cursor()
@@ -330,7 +381,7 @@ def health(update, context):
     except Exception as e:
         update.message.reply_text(f"DB error: {e}")
 
-# ---------------- Text Router ----------------
+# ---------------- Text Router (default: expense) ----------------
 def text_router(u, c):
     parts = (u.message.text or "").strip().split(None, 2)
     if len(parts) < 2:
@@ -364,6 +415,7 @@ def main():
     up.bot.delete_webhook(drop_pending_updates=True)
 
     dp = up.dispatcher
+    # Core
     dp.add_handler(CommandHandler("help", help_command))
     dp.add_handler(CommandHandler("sum", sum_all))
     dp.add_handler(CommandHandler("today", today))
@@ -374,8 +426,13 @@ def main():
     dp.add_handler(CommandHandler("delete", delete_command))
     dp.add_handler(CommandHandler("clear", clear_command))
     dp.add_handler(CallbackQueryHandler(clear_callback, pattern="^clear_(confirm|cancel)$"))
+    # Revenue
+    dp.add_handler(CommandHandler("revenue", revenue_command))
+    dp.add_handler(CommandHandler("totalrevenue", totalrevenue_command))
+    # Diagnostics
     dp.add_handler(CommandHandler("debugdb", debugdb))
     dp.add_handler(CommandHandler("health", health))
+    # Text → expense
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_router))
     dp.add_error_handler(on_error)
 
