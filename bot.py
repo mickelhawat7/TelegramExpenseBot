@@ -230,12 +230,14 @@ def schedule_autodelete(job_queue, chat_id, msg_id, seconds=60):
 # ---------------- Commands ----------------
 def help_command(update: Update, context: CallbackContext):
     txt = (
-        "🧠 Welcome to your AI Data Tracker!\n\n"
+        "**🧠 Welcome to your AI Data Tracker!**\n\n"
         "Easily log, visualize, and manage your financial data — both 💸 expenses and 💵 revenues.\n\n"
-        "🧾 To log an expense:\n"
+        "───────────────\n"
+        "**🧾 To log an expense:**\n"
         "Category Amount [optional note]\n"
-        "Example: Food 2500 Lunch\n\n"
-        "✨ Commands:\n"
+        "Example: Food 2500 Lunch\n"
+        "───────────────\n\n"
+        "✨ **Commands:**\n"
         "📊 /sum — Totals by expense category\n"
         "🗓 /today — Today’s expenses\n"
         "📅 /week — This week’s expenses\n"
@@ -244,12 +246,13 @@ def help_command(update: Update, context: CallbackContext):
         "🔎 /detail <category> — View category details\n"
         "❌ /delete <id> — Delete a single entry\n"
         "🗑️ /clear — Clear all data and reset IDs\n\n"
-        "💵 To log a revenue:\n\n"
+        "───────────────\n"
+        "**💵 To log a revenue:**\n"
         "/revenue <amount> [note] — Log a revenue entry\n"
         "🧮 /totalrevenue — View detailed revenue list and total\n\n"
-        "💡 All entries are automatically saved and logged in dollars ($)."
+        "_💡 All entries are automatically saved and logged in dollars ($)._"
     )
-    m = update.message.reply_text(txt)
+    m = update.message.reply_text(txt, parse_mode="Markdown")
     schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
 
 
