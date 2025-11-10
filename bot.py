@@ -100,15 +100,14 @@ def log_revenue_to_db(amount, note):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with connect_db() as conn:
         c = conn.cursor()
-        # Store category as 'revenue' for clarity (not used in sums)
         c.execute(
             "INSERT INTO expenses (timestamp,user,entry_type,name,amount,category,note,payment_method,account_type)"
             " VALUES (?,?,?,?,?,?,?,?,?)",
             (now, "", "Revenue", "", amount, "revenue", note, "", ""),
         )
-        rev_id = c.lastrowid
+        rid = c.lastrowid
         conn.commit()
-        return rev_id
+        return rid
 
 def get_totals_all(start=None, end=None):
     with connect_db() as conn:
@@ -131,6 +130,16 @@ def get_total_revenue_all():
         c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE entry_type='Revenue'")
         return int(round(c.fetchone()[0] or 0))
 
+def get_all_revenue_rows():
+    """Return list of (id, timestamp, amount, note) for all revenue entries (newest first)."""
+    with connect_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, timestamp, amount, note FROM expenses "
+            "WHERE entry_type='Revenue' ORDER BY datetime(timestamp) DESC, id DESC"
+        )
+        return c.fetchall()
+
 def clear_all_data_and_reset_ids():
     with connect_db() as conn:
         c = conn.cursor()
@@ -152,10 +161,10 @@ def get_categories_with_sums_all():
         )
         return c.fetchall()
 
-def delete_expense_by_id_global(expense_id):
+def delete_expense_by_id_global(entry_id):
     with connect_db() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+        c.execute("DELETE FROM expenses WHERE id=?", (entry_id,))
         conn.commit()
         return c.rowcount > 0
 
@@ -201,25 +210,32 @@ def parse_amount(token: str) -> int:
 def fmt_money_int(x):
     return f"${int(round(x)):,}"
 
+def send_long_message(update: Update, text: str):
+    """Split long messages to respect Telegram 4096 char limit."""
+    CHUNK = 4000
+    for i in range(0, len(text), CHUNK):
+        update.message.reply_text(text[i:i+CHUNK])
+
 # ---------------- Commands ----------------
 def help_command(update: Update, context: CallbackContext):
     txt = (
-        "💰 Welcome to your Expense AI Tracker!\n\n"
-        "To log an expense, simply type:\n"
+        "🧠 Welcome to your AI Data Tracker!\n\n"
+        "Easily log, visualize, and manage your financial data — both 💸 expenses and 💵 revenues.\n\n"
+        "🧾 To log an expense:\n"
         "Category Amount [optional note]\n"
         "Example: Food 2500 Lunch\n\n"
         "✨ Commands:\n"
-        "📊 /sum — Totals by category (expenses)\n"
+        "📊 /sum — Totals by expense category\n"
         "🗓 /today — Today’s expenses\n"
         "📅 /week — This week’s expenses\n"
         "📈 /month — This month’s expenses\n"
         "🏆 /top — Expense charts\n"
-        "🔎 /detail <category> — Details for a category\n"
-        "❌ /delete <id> — Delete an entry\n"
+        "🔎 /detail <category> — View category details\n"
+        "❌ /delete <id> — Delete a single entry\n"
         "🗑️ /clear — Clear all data and reset IDs\n"
         "💵 /revenue <amount> [note] — Log a revenue entry\n"
-        "🧮 /totalrevenue — Total revenue to date\n\n"
-        "💡 All entries are logged in $."
+        "🧮 /totalrevenue — View detailed revenue list and total\n\n"
+        "💡 All entries are automatically saved and logged in dollars ($)."
     )
     m = update.message.reply_text(txt)
     schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
@@ -285,7 +301,7 @@ def top_command(update: Update, context: CallbackContext):
     plt.close(fig1)
 
     with open(pie, "rb") as f:
-        pie_msg = update.message.reply_photo(f)
+        update.message.reply_photo(f)
     try:
         os.remove(pie)
     except Exception:
@@ -344,25 +360,44 @@ def clear_callback(u, c):
 def revenue_command(update: Update, context: CallbackContext):
     """Usage: /revenue <amount> [optional note]"""
     if not context.args:
-        m = update.message.reply_text("Usage: /revenue <amount> [note]")
-        return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+        update.message.reply_text("Usage: /revenue <amount> [note]")
+        return
     try:
         amount = parse_amount(context.args[0])
     except Exception:
-        m = update.message.reply_text("❌ Enter a valid whole number. Example: /revenue 5000 Client A")
-        return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+        update.message.reply_text("❌ Enter a valid whole number. Example: /revenue 5000 Client A")
+        return
     note = " ".join(context.args[1:]) if len(context.args) > 1 else ""
     rid = log_revenue_to_db(amount, note)
     total_rev = get_total_revenue_all()
-    msg = update.message.reply_text(
+    # DO NOT auto-delete this one (per your request)
+    update.message.reply_text(
         f"✅ Revenue logged (ID {rid})\n💵 Total Revenue to Date: {fmt_money_int(total_rev)}"
     )
-    schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
 
 def totalrevenue_command(update: Update, context: CallbackContext):
-    total_rev = get_total_revenue_all()
-    msg = update.message.reply_text(f"🧮 Total Revenue to Date: {fmt_money_int(total_rev)}")
-    schedule_autodelete(context.job_queue, msg.chat_id, msg.message_id)
+    rows = get_all_revenue_rows()
+    total_rev = sum(int(round(r[2])) for r in rows) if rows else 0
+    if not rows:
+        m = update.message.reply_text("No revenue logged yet.")
+        return schedule_autodelete(context.job_queue, m.chat_id, m.message_id)
+
+    # Build detailed list
+    lines = []
+    for _id, ts, amt, note in rows:
+        note_part = f" {note}" if note else ""
+        lines.append(f"#{_id} · {ts} · {fmt_money_int(amt)}{note_part}")
+
+    header = "💵 Revenue Entries:\n\n"
+    footer = f"\n🧮 Total Revenue to Date: {fmt_money_int(total_rev)}"
+    text = header + "\n".join(lines) + footer
+
+    # Safe send (split if long)
+    send_long_message(update, text)
+    # Optional: auto-delete summaries (keeping defaults)
+    # If you prefer to keep /totalrevenue on screen, comment out the two lines below.
+    # m = update.message.reply_text("— End of revenue report —")
+    # schedule_autodelete(context.job_queue, m.chat_id, m.message_id, 60)
 
 # ----- Diagnostics -----
 def debugdb(update, context):
